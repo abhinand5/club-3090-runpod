@@ -5,6 +5,8 @@ This directory contains the model + engine-specific patches that different compo
 | File | Used by | Purpose |
 |---|---|---|
 | `patch_tolist_cudagraph.py` | single-card default + dual-turbo | CUDA graph capture fix for TurboQuant continuation prefill |
+| `patch_pn12_ffn_pool_anchor.py` | long-text | Local PN12 anchor repair for the SiluAndMul FFN intermediate pool on dev205+ |
+| `patch_fa_max_seqlen_clamp.py` | long-text | Local P104-style FA2 `max_seqlen_k` runtime clamp |
 | `patch_pr40798_workspace.py` | (none — research artifact) | Negative-result reproducer for vllm#40798 |
 | `genesis/` | single-card default + dual-turbo | Sandermage's Genesis v7.14 patch tree (gitignored; fetched by setup.sh) |
 | External: `/opt/ai/vllm-src/` (Marlin pad fork) | all 4 dual-card composes | vLLM PR #40361 patched source, not a file in this repo |
@@ -14,7 +16,7 @@ This directory contains the model + engine-specific patches that different compo
 ## When you need each patch
 
 - **Single-card default** (`docker-compose.yml`) — uses TurboQuant 3-bit KV + Genesis v7.14 P65 + tolist patch. Fetched by `setup.sh qwen3.6-27b`.
-- **Single-card no-genesis-mtp / minimal** — fp8 KV, no patches needed.
+- **Single-card minimal** — fp8 KV, no patches needed (escape hatch if `setup.sh` Genesis clone fails).
 - **Single-card tools-text** — fp8 KV + Genesis (P64 qwen3-coder tool parser fix + PN8 memory savings); no tolist patch (fp8 doesn't trip the bug).
 - **Dual-card default + DFlash variants** — fp8 / fp16 KV. Need only the Marlin pad fork (no Genesis, no tolist).
 - **Dual-card turbo** — TQ KV + Genesis v7.14 + tolist + Marlin pad fork.
@@ -71,6 +73,26 @@ capture unless the CPU tensor is pinned.
 
 ---
 
+## `patch_pn12_ffn_pool_anchor.py` (long-text Cliff 1 attack)
+
+**What it fixes:** Genesis PN12 can silently no-op on vLLM dev205+ because its text anchor expects `SiluAndMul.forward_cuda` to be followed directly by `@CustomOp.register("silu_and_mul_with_clamp")`. Current `activation.py` has the `MulAndSilu` section there instead, so the Genesis dispatcher can say PN12 applied while the live method still allocates with `torch.empty(output_shape, ...)`.
+
+**How:** disk-edit at container startup, after Genesis. Replaces only `SiluAndMul.forward_cuda` with PN12's env-gated pooled-output body, anchored within the current `SiluAndMul` class. Runtime pooling still requires `GENESIS_ENABLE_PN12_FFN_INTERMEDIATE_POOL=1`.
+
+**Why this lives here, not Genesis:** this is a local Cliff 1 diagnostic/fix path. Do not push it to Sandermage's tree unless we decide on a PR after the local stack is proven.
+
+---
+
+## `patch_fa_max_seqlen_clamp.py` (long-text Cliff 1 attack)
+
+**What it fixes:** FlashAttention 2 varlen allocates `softmax_lse` from `max_seqlen_k`, not the actual `cu_seqlens_k` span. Long-context TurboQuant metadata can pass a conservative upper bound, so a much shorter chunk pays the full max-context workspace cost.
+
+**How:** disk-edit at container startup, after Genesis. Replaces TurboQuant's `_flash_attn_varlen` helper so runtime calls clamp `max_seqlen_k` to `max(actual cu_seqlens_k span, max_seqlen_q)`. It skips CUDA graph capture and still requires `GENESIS_ENABLE_FA_MAX_SEQLEN_CLAMP=1`.
+
+**Why this lives here, not Genesis:** this is the held P104 work converted into a local sidecar. Keep it local until the Cliff 1 stack is proven and we explicitly decide PR strategy.
+
+---
+
 ## `patch_pr40798_workspace.py` (research artifact)
 
 **What this is NOT:** a fix.
@@ -107,4 +129,4 @@ Genesis v7.14+ ships several patches as opt-in env flags. Each compose enables o
 | ~~`GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1`~~ | ~~Long-ctx tool-format adherence~~ — **disabled 2026-04-29**, breaks IDE agents (see [club-3090#2](https://github.com/noonghunna/club-3090/issues/2#issuecomment-4346740245)) | (none — opt-in only) |
 | ~~`GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1`~~ | ~~Long-ctx tool-format reminder~~ — **disabled 2026-04-29**, same reason | (none — opt-in only) |
 
-Composes that don't load Genesis (no-genesis-mtp, minimal, dual-default, dual-dflash, dual-dflash-noviz) ignore these env vars.
+Composes that don't load Genesis (minimal, dual-default, dual-dflash, dual-dflash-noviz) ignore these env vars.

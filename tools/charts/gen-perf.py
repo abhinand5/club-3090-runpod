@@ -19,13 +19,20 @@ from pathlib import Path
 OUT = Path(__file__).resolve().parents[2] / "docs" / "img"
 
 # (label, narr_tps, code_tps, group)
+# Single-card vLLM TPS from R3' / R3''' bench rows; long-vision/long-text
+# now ship at 198K / 218K respectively (verified 2026-04-30 PM); historical
+# bench numbers carry forward since steady-state TPS is the same regime.
+# Luce DFlash measured 2026-04-30 PM on Qwen3.6-27B Q4_K_M + matched 3.6
+# draft (TQ3 KV, max_ctx=65K, greedy only). Group "single-luce-watch" =
+# experimental / not recommended for shipping yet; see docs/UPSTREAM.md.
 configs_all = [
     ("v714 48K\n(default)",       55.00, 70.50, "single-vllm"),
-    ("v714 192K\n+ vision",       50.93, 67.69, "single-vllm"),
-    ("v714 205K\ntext-only",      50.11, 65.84, "single-vllm"),
+    ("long-vision 198K\n+ vision",       50.93, 67.69, "single-vllm"),
+    ("long-text 218K\ntext-only",      50.11, 65.84, "single-vllm"),
     ("minimal\n(no spec-dec)",    32.41, 32.56, "single-vllm"),
     ("llama.cpp Q3_K_XL\n262K + vision", 21.22, 20.79, "single-llama"),
     ("llama.cpp Q4_K_M\n+ ngram-mod 32K",22.04, 26.11, "single-llama"),
+    ("Luce DFlash 3.6+3.6*\nTQ3, 65K, greedy", 40.00, 71.65, "single-luce-watch"),
     ("dual.yml\n262K + vision",   69.05, 88.58, "dual-vllm"),
     ("dual-turbo\n4 streams 262K",53.65, 72.93, "dual-vllm"),
     ("dual-dflash\n185K + vision",81.94, 124.93, "dual-vllm"),
@@ -33,14 +40,16 @@ configs_all = [
 ]
 
 GROUP_COLORS = {
-    "single-vllm":  ("#9ec5e8", "#2c7fb8"),
-    "single-llama": ("#fdd0a2", "#e6550d"),
-    "dual-vllm":    ("#a1d99b", "#2c8a2c"),
+    "single-vllm":         ("#9ec5e8", "#2c7fb8"),
+    "single-llama":        ("#fdd0a2", "#e6550d"),
+    "single-luce-watch":   ("#dadaeb", "#807dba"),
+    "dual-vllm":           ("#a1d99b", "#2c8a2c"),
 }
 GROUP_LABELS = {
-    "single-vllm":  "single 3090 — vLLM patched",
-    "single-llama": "single 3090 — llama.cpp",
-    "dual-vllm":    "2× 3090 — vLLM (TP=2)",
+    "single-vllm":         "single 3090 — vLLM patched",
+    "single-llama":        "single 3090 — llama.cpp",
+    "single-luce-watch":   "single 3090 — Luce DFlash *experimental*",
+    "dual-vllm":           "2× 3090 — vLLM (TP=2)",
 }
 
 
@@ -77,18 +86,18 @@ def make_chart(configs, out_stem, title_subject, figsize):
     groupseen = {}
     for i, g in enumerate(groups):
         groupseen.setdefault(g, []).append(i)
-    y_band = max(max(narr), max(code)) * 1.10
+    y_band = max(max(narr), max(code)) * 1.18
     for g, idxs in groupseen.items():
         mid = (idxs[0] + idxs[-1]) / 2
         ax.text(mid, y_band, GROUP_LABELS[g], ha="center", va="bottom",
-                fontsize=10, fontweight="bold", color="#222")
+                fontsize=9.5, fontweight="bold", color="#222")
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=9)
     ax.set_ylabel("TPS  (3 warm + 5 measured, canonical bench)", fontsize=10)
-    ax.set_title(f"Qwen3.6-27B  —  measured TPS {title_subject}  on  noonghunna/club-3090  (2026-04-28)",
-                 fontsize=12, pad=22)
-    ax.set_ylim(0, max(max(narr), max(code)) * 1.20)
+    ax.set_title(f"Qwen3.6-27B  —  measured TPS {title_subject}  on  noonghunna/club-3090  (2026-04-30)",
+                 fontsize=12, pad=36)
+    ax.set_ylim(0, max(max(narr), max(code)) * 1.30)
     ax.grid(axis="y", linestyle=":", alpha=0.4)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -101,8 +110,12 @@ def make_chart(configs, out_stem, title_subject, figsize):
               ncol=2, fontsize=9, frameon=False)
 
     ax.text(0.5, -0.22,
-            "Substrate: vLLM nightly dev205+g07351e088 + Genesis 917519b (v7.62.x)  •  llama.cpp mainline 0d0764dfd  •  RTX 3090 sm_86, PCIe-only, 230W",
+            "Substrate: vLLM nightly dev205+g07351e088 + Genesis 917519b (v7.62.x)  •  llama.cpp mainline 0d0764dfd  •  Luce DFlash dflash@f12a87c (greedy only)  •  RTX 3090 sm_86, PCIe-only, 230W",
             transform=ax.transAxes, ha="center", va="top", fontsize=8, color="#555", style="italic")
+    if any(g == "single-luce-watch" for g in groups):
+        ax.text(0.5, -0.30,
+                "* Luce DFlash 3.6+3.6 = experimental: matched draft still under training (z-lab 2026-04-26 snapshot), greedy-only sampling, no vision, daemon-mode bugs. Not yet recommended for shipping. See docs/UPSTREAM.md.",
+                transform=ax.transAxes, ha="center", va="top", fontsize=7.5, color="#777", style="italic", wrap=True)
 
     plt.tight_layout()
     svg_path = OUT / f"{out_stem}.svg"
@@ -116,6 +129,6 @@ def make_chart(configs, out_stem, title_subject, figsize):
 single_configs = [c for c in configs_all if c[3].startswith("single-")]
 dual_configs   = [c for c in configs_all if c[3].startswith("dual-")]
 
-make_chart(configs_all,    "performance",        "per config",          figsize=(14, 6.5))
-make_chart(single_configs, "performance-single", "(single 3090)",       figsize=(11, 6.0))
-make_chart(dual_configs,   "performance-dual",   "(2× 3090, TP=2)",     figsize=(8.5, 6.0))
+make_chart(configs_all,    "performance",        "per config",          figsize=(15, 7.0))
+make_chart(single_configs, "performance-single", "(single 3090)",       figsize=(13, 6.5))
+make_chart(dual_configs,   "performance-dual",   "(2× 3090, TP=2)",     figsize=(8.5, 6.5))

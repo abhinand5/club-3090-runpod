@@ -43,6 +43,9 @@ Each row covers one upstream link with: **title • status • our dependency / 
 | [#40875](https://github.com/vllm-project/vllm/issues/40875) — ngram + MTP coexistence | ✅ Closed | Routed via `prompt_lookup_min=8` flag. | Set in compose where applicable. |
 | [#41142](https://github.com/vllm-project/vllm/pull/41142) — Quentin-M streaming tool-call IndexError | 🟡 Open / Genesis backport active | Closes a streaming tool-call crash on Hermes / similar templates. | Genesis PN11 backport (auto-enabled where REC). |
 | [#39598](https://github.com/vllm-project/vllm/pull/39598) — kotori-yan qwen3coder MTP streaming early-return | 🟡 Open / Genesis backport active | Empty `tool_calls[]` when MTP bundles last param + `</function>` in same delta. | Genesis P64 backport: `GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1` (default-on in our composes). |
+| [#40961](https://github.com/vllm-project/vllm/pull/40961) — Preserve max_seq_len in ubatch metadata during CUDA graph capture | 🟡 Open PR | Confirms the cap-leak pattern: cudagraph capture passes `max_model_len` as `max_seq_len` through ubatch metadata. PR is *fixing a missing pass-through* for SWA models (where seqlen=1 at capture broke kernel selection) — by establishing that `max_model_len` is what gets carried through capture metadata, it cements the source of Cliff 1's max-ctx-dependent FA2 workspace sizing. | Stay at `default` 48K — see FA2 #1011 row + INTERNALS.md Cliff 1 mechanism. |
+| [#40069](https://github.com/vllm-project/vllm/issues/40069) — [Tracking] TurboQuant / HIGGS Attention follow-ups | 🟡 Open tracker | Umbrella tracking for TurboQuant + attention backend issues on our stack class. | Watch for cross-references when Cliff 1/2 work lands upstream. |
+| [#25543](https://github.com/vllm-project/vllm/pull/25543) — [V0 Deprecation] Remove `max_seq_len_to_capture` | ✅ Merged 2025-09-24 | Important to know: the `--max-seq-len-to-capture` flag (commonly suggested as a Cliff 1 mitigation) **does not exist in V1**. Don't recommend it. | n/a — flag removed. |
 
 ---
 
@@ -54,14 +57,24 @@ Each row covers one upstream link with: **title • status • our dependency / 
 | [#6](https://github.com/Sandermage/genesis-vllm-patches/issues/6) — P65 PIECEWISE cost quantified | ✅ Closed | We characterized the +22 TPS narrative cost of P65 on Qwen3.6-27B + MTP. Sandermage acknowledged. Will recover when vllm#40914 lands. | Accept the cost on substrate-current; ampersandru's pre-P65 stack avoids it. |
 | [#7](https://github.com/Sandermage/genesis-vllm-patches/issues/7) — P67 Triton CompilationError on Qwen3.6-27B | 🟡 Open | P67 (multi-query verify kernel, +25–35% TPS) crashes on GQA != power-of-2. Affects 27B specifically. | P67 left off by default on 27B configs. |
 | [#9](https://github.com/Sandermage/genesis-vllm-patches/issues/9) — P68/P69 8000-char threshold breaks IDE agents | 🔴 Open (we filed 2026-04-29) | P68 silently rewrites `tool_choice: auto → required`; P69 injects "must use a tool" hint. Both fire at default 8000-char threshold — every IDE agent context exceeds that. | All shipped composes have `P68/P69` commented out. See [`docs/FAQ.md`](FAQ.md#will-this-work-with-vs-code-github-copilot-llm-gateway). |
+| [#11](https://github.com/Sandermage/genesis-vllm-patches/issues/11) — Cliff 1 root cause traced to FA2 softmax_lse padded by max_seqlen, asking about Genesis-style clamp | 🟡 Open (we filed 2026-04-29). Updated 2026-04-30 PM with revised diagnosis: PN12 anchor-fix closes mech B (the binding constraint on TQ3+single-card); FA2 clamp question becomes optional. Local P104 sidecar covers mech A defensively. | If feasible, FA2 clamp would structurally close mech A. With PN12 anchor-fixed (PR #13) the cliff already closes at 205K — clamp is now defensive coverage rather than required. | P104 sidecar covers mech A locally. PR'ing P104 to Genesis is open question — pending Sandermage's preference on whether to keep that change in Genesis scope. |
+| **P104 FA max_seqlen_k runtime clamp** (we built 2026-04-30) | 🟡 Local sidecar `models/qwen3.6-27b/vllm/patches/patch_fa_max_seqlen_clamp.py` — **held back from PR pending Sandermage's response on #11** | Implements the Genesis-style FA call-site clamp from issue #11. Env-gated `GENESIS_ENABLE_FA_MAX_SEQLEN_CLAMP=1`, runtime-only (skips under cudagraph capture), never under-clamps. ~260 lines following Genesis's text-patch infrastructure. | Already shipped locally — when Sandermage merges (or when GENESIS_PIN bumps to a commit including it), we can drop the sidecar. |
+| [PR #12](https://github.com/Sandermage/genesis-vllm-patches/pull/12) — **P101 anchor drift fix** (we found + fixed 2026-04-30) | 🟢 Open (we opened 2026-04-30) | P101 was silently no-op on vLLM dev205+ — anchor `_arange_cache[...]` no longer matches upstream `torch.arange(...)` form. apply_all reported "applied" misleadingly. Anyone running v7.62.x with `GENESIS_ENABLE_P101=1` on dev205+ gets a no-op. | Pending merge. Local branch carries the fix in the meantime. |
+| [PR #13](https://github.com/Sandermage/genesis-vllm-patches/pull/13) — **PN12 anchor drift fix** (we found + fixed 2026-04-30 PM) | 🟢 Open (we opened 2026-04-30) | PN12's FFN intermediate pool was silently no-op'd on dev205+ — anchor expected `@CustomOp.register("silu_and_mul_with_clamp")` after `SiluAndMul`, upstream now has `MulAndSilu` in that slot. Genesis `apply_all` reported "applied" while live `vllm/model_executor/layers/activation.py` retained vanilla `SiluAndMul.forward_cuda`. **This was the missing piece for Cliff 1 mech B at 205K** — once the anchor is repaired, full stack closes the cliff (verify-full + verify-stress pass at 205K + MTP n=3). | Local sidecar `models/qwen3.6-27b/vllm/patches/patch_pn12_ffn_pool_anchor.py` carries the fix in the meantime. |
 
 ---
+
+## FlashAttention 2 (`Dao-AILab/flash-attention`)
+
+| Issue / PR | Status | Why it matters | Workaround |
+|---|---|---|---|
+| [#1011](https://github.com/Dao-AILab/flash-attention/issues/1011) — Variable memory allocation with varlen kernels | 🔴 Open since 2024, no fix | **Cliff 1 root cause.** `softmax_lse` is allocated as `[num_seqs, num_heads, max_seqlen]` — sized by `max_seqlen` parameter, NOT actual `cu_seqlens`. So a 25K-token chunked-prefill at `max_model_len=86K` allocates softmax_lse for 86K, not 25K. This is why Cliff 1 fires harder at higher max-ctx even when the actual prompt is the same. | None. Stay at `default` 48K (or `tools-text` 75K with PN8 mitigation). FA2 redesign of softmax_lse format would be the upstream fix. |
 
 ## flash-linear-attention (`fla-org/flash-linear-attention`)
 
 | Issue / PR | Status | Why it matters | Workaround |
 |---|---|---|---|
-| **Cliff 2 — DeltaNet GDN forward OOM at 50–60K single-prompt** | 🔴 Open, **no upstream issue filed yet** | The `chunk_gated_delta_rule_fwd` kernel allocates intermediate buffers proportional to `seq_len`. Fires regardless of mem-util. Sandermage explicitly punted (genesis-vllm-patches issue #1: *"can't fix this short of multi-GPU TP=2 or upstream fla.ops changes"*). | None on single-card vLLM. Use `tools-text.yml` (75K cap), `dual.yml` (TP=2 splits per-card seq_len), or `llamacpp/default` (262K, different engine, no DeltaNet OOM). |
+| **Cliff 2 — DeltaNet GDN forward OOM at 50–60K single-prompt** | 🔴 Open, **no upstream issue filed yet**. **Confirmed cleared on dual TP=2** (this rig, 2026-04-29 — see DUAL_CARD.md "237K single-prompt verified"). | The `chunk_gated_delta_rule_fwd` kernel allocates intermediate buffers proportional to `seq_len`. Fires on single-card regardless of mem-util. On dual TP=2 the activation memory splits across cards and the cliff doesn't fire — verified at 237K single-prompt prefill on `dual.yml` (~830 tok/s prefill, matches Sandermage's 262K @ 311s on 2× A5000). Sandermage explicitly punted on the single-card fix (genesis-vllm-patches issue #1: *"can't fix this short of multi-GPU TP=2 or upstream fla.ops changes"*). Likely the same architectural pattern as FA#1011 — recurrent state buffer pre-allocated by max_seq_len. | Single-card: use `tools-text.yml` (75K cap) or `llamacpp/default` (262K, different engine). Dual: `dual.yml` clears at ≥237K. |
 
 ---
 
@@ -70,6 +83,21 @@ Each row covers one upstream link with: **title • status • our dependency / 
 | Issue / PR | Status | Why it matters | Workaround |
 |---|---|---|---|
 | **Ampere SM 8.6 / Ada SM 8.9 port** | 🔴 No issue filed; tweet to @QwenLM drafted but not yet posted | FlashQLA is QwenLM's TileLang DeltaNet kernels — would fix Cliff 2 if it ran on Ampere. Currently SM90+ only. | None. Watch the repo for Ampere support; revisit when an issue is filed and a port is on the roadmap. |
+
+---
+
+## Luce DFlash (`Luce-Org/lucebox-hub`)
+
+Watch list — promising on code-heavy single-stream workloads but not yet a club-3090 shipping option. Re-benched 2026-04-30 PM on Qwen3.6-27B Q4_K_M + matched z-lab/Qwen3.6-27B-DFlash draft (under training).
+
+| Issue / PR | Status | Why it matters | Workaround |
+|---|---|---|---|
+| [z-lab/Qwen3.6-27B-DFlash](https://huggingface.co/z-lab/Qwen3.6-27B-DFlash) — draft model still under training | 🟡 Snapshot 2026-04-26 | Narrative AL ~3.7, code AL ~7.0. When training finishes, expected to climb toward Qwen3.5 reference (8.31 HE, 7.04 Math). Today: code 72 TPS / narr 40 TPS on our 3090 vs vLLM's 66/50. | Re-test when z-lab tags training-complete. |
+| **Build fragility on `dflash` main HEAD** | 🔴 Reproducible 2026-04-30 PM | `cmake --build` errors with `ggml_turbo_wht` and `GGML_TYPE_TQ3_0` undefined. Required submodule commit `b6ffab4a9` not auto-fetched. Cross-rig signal — fresh clone fails. | After clone: `cd dflash/deps/llama.cpp && git fetch origin && cd ../../.. && git submodule update --init`. |
+| **Daemon-mode "empty prompt" regression** | 🔴 Reproducible 2026-04-30 PM | After streaming requests, subsequent requests return `"empty prompt"` from the test_dflash daemon. Server keeps accepting requests but generates 0 tokens. Forces restart. | Restart server between request flavors; avoid mixing streaming + non-streaming. |
+| **`enable_thinking` chat_template_kwargs honored differently than vLLM** | 🟡 Behavioural difference | Test sends `enable_thinking=true` and expects `reasoning_content` populated. Luce returns `content` directly. Not a missing feature, but breaks our `verify-full.sh` check 6. | Don't treat the thinking-mode test as a Luce-correctness signal until the chat-template path is documented. |
+| **Greedy only** | 🟡 Documented limitation | `temperature` / `top_p` accepted but ignored. Real downside for creative-writing workloads. | Use vLLM long-text/long-vision when sampling matters. |
+| **Prefill OOM in `fattn-chunked.cu` on 25K+ prompts at Q8_0 KV** | 🟡 Open (configuration trade) | Chunked flash-attention CUDA OOMs on large prefill at default Q8_0. **TQ3 KV (`DFLASH27B_KV_TQ3=1`) closes it** at max_ctx=65K — verify-stress passes 791 chars / finish=stop. Higher max_ctx (131K) reopens it. | Always set `DFLASH27B_KV_TQ3=1` for stress-test-passing config. Cap max_ctx at ~65K. |
 
 ---
 

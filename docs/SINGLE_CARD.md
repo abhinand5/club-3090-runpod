@@ -6,16 +6,25 @@ You have **one RTX 3090 (24 GB VRAM)**. This page is the front door for picking 
 
 ## TL;DR — pick by workload
 
-| What you're doing | Compose | Narr / Code TPS | Why |
-|---|---|---|---|
-| Tool-using IDE agents (Cline / Cursor / Copilot Gateway) | [`tools-text.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.tools-text.yml) | **51 / 65** | 75K ctx, **Cliff 1 closed** via Genesis PN8 (2026-04-29) |
-| General-purpose default (≥20K, vision + tools) | [`docker-compose.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.yml) | **50 / 67** | 48K, TQ3 KV, prefill-safe |
-| Long single prompts (RAG / summarization, no vision) | [`tools-text.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.tools-text.yml) (vLLM 75K) **or** [llama.cpp recipe](../models/qwen3.6-27b/llama-cpp/) (262K) | 51/65 (vLLM) · 21/21 (llama.cpp) | fp8 KV avoids GDN cliff up to ~60K; llama.cpp avoids cliffs entirely |
-| Frontier 192K + vision | [`long-vision.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.long-vision.yml) | 51 / 68 | Engine ceiling; ⚠️ Cliff 1 still fires on >25K tool prefills |
-| Frontier 205K text-only | [`long-text.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.long-text.yml) | 50 / 66 | Engine ceiling |
-| Easy mode (one Docker line, 262K, no patches) | [`llamacpp/default`](../models/qwen3.6-27b/llama-cpp/compose/docker-compose.yml) | 21 / 21 | Q3_K_XL + q4_0 KV; no prefill cliffs anywhere |
+Three recommended options:
 
-Run any of these via `bash scripts/launch.sh` (interactive) or `bash scripts/switch.sh <variant>`.
+| What you're doing | Compose | Max ctx | Narr / Code TPS |
+|---|---|---|---|
+| **Long ctx + vision** (chat, agents, image input) | [`long-vision.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.long-vision.yml) | **198K** | 51 / 68 |
+| **Long ctx, text-only** (RAG, codebase, books) | [`long-text.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.long-text.yml) | **218K** | 50 / 66 |
+| **Bulletproof, no cliffs** (production service, unpredictable inputs) | [`llamacpp/default`](../models/qwen3.6-27b/llama-cpp/compose/docker-compose.yml) | **262K** | 21 / 21 |
+
+Run via `bash scripts/launch.sh` (interactive) or `bash scripts/switch.sh <variant>`.
+
+> ## ⚠️ The one limitation to know
+>
+> **vLLM single-card variants will crash if you send a single prompt above ~50K tokens.**
+>
+> This is Cliff 2 — DeltaNet GDN forward OOMs at 50–60K single-shot regardless of how much VRAM you have left. Both `long-vision.yml` (198K) and `long-text.yml` (218K) are designed for **steady-state accumulation across many turns** — context that builds up across tool calls, replies, retrieved chunks. They are NOT designed for "paste an 80K-token document and ask one question."
+>
+> **If your workload ever sends single big prompts:** use `llamacpp/default` (262K, no cliffs anywhere — different engine entirely) or move to dual-card (`dual.yml` TP=2, verified at 237K).
+>
+> Cliff 1 (the 25K-token tool-prefill OOM that historically blocked these variants) is closed as of 2026-04-30 PM via the PN12 anchor sidecar. Tool-using agents that send big tool returns are fine on `long-vision` / `long-text`.
 
 ---
 
@@ -36,7 +45,7 @@ What this says about single-card constraints:
 - **Model weights** consume ~14 GB (AutoRound INT4 / GGUF Q3_K_XL). Half the card.
 - **KV cache** is the next biggest line; its size depends on `--kv-cache-dtype` × ctx. fp8 ≈ 1 byte/token/(layer×head); TQ3 ≈ 0.4 bytes/token/(layer×head); fp16 ≈ 2 bytes/token/(layer×head).
 - **Vision tower** (mmproj) costs ~0.5–1.0 GB extra when on.
-- **Activations + cudagraph pools** is what's left. At `--gpu-memory-utilization 0.92` (default 48K) you have 2-3 GB of activation headroom — comfortable. At 0.98 (long-vision / long-text), <0.5 GB — that's where prefill cliffs fire.
+- **Activations + cudagraph pools** is what's left. At `--gpu-memory-utilization 0.92` (default 48K) you have 2-3 GB of activation headroom — comfortable. At 0.98–0.985 (long-vision / long-text), <0.5 GB — historically where Cliff 1 fired. **As of 2026-04-30 PM**, anchor-fixed PN12 (which actually pools FFN intermediates instead of fresh-allocating per layer) cuts allocator churn enough that long-vision survives 0.98 + 198K and long-text survives 0.985 + 218K. Pushing mem-util past 0.985 fails on this hardware (driver/system reserves ~440 MiB).
 
 For the cross-card TP=2 picture, see [`DUAL_CARD.md`](DUAL_CARD.md).
 
@@ -44,52 +53,62 @@ For the cross-card TP=2 picture, see [`DUAL_CARD.md`](DUAL_CARD.md).
 
 ## Pick a config
 
-### Tool-using IDE agents — `tools-text.yml`
+### Long ctx + vision — `long-vision.yml` ⭐
 
-**Workload:** Cline, Cursor, GitHub Copilot LLM Gateway, Continue.dev, Hermes — anything that calls tools (`read_file`, `run_in_terminal`, `web_fetch`) and expects structured `tool_calls[]` responses.
+**Workload:** chat with images, vision-aware coding agents, multimodal RAG. Anything where the user might paste a screenshot.
 
-75K context with fp8 KV + Genesis MTP n=3 + PN8. As of 2026-04-29 this compose's **`verify-stress.sh` 25K-token tool-prefill check passes clean** — Cliff 1 closed via PN8 freeing ~900 MiB. The **only single-card path that's safe with big tool returns**.
+198K + vision tower + TQ3 KV + Genesis MTP n=3 + PN12 anchor sidecar + P104 sidecar. Cliff 1 closed (25K-token tool prefills survive). `verify-full.sh` all 8 checks pass; `verify-stress.sh` tool-prefill passes at 643 chars.
 
-**Two gotchas worth surfacing:**
+### Long ctx, text-only — `long-text.yml` ⭐
 
-- **VS Code Copilot LLM Gateway sends ~20K tokens of tool schema** in every request. The 48K default *just* fits this with room for a chat turn; `tools-text.yml` (75K) is the safer choice for Copilot specifically.
-- **Truncated `max_tokens`** (some clients send 64) cuts tool-call JSON mid-string — produces malformed output that some gateways report as "empty response." That's a client config issue, not the server. See [FAQ: Copilot Gateway](FAQ.md#will-this-work-with-vs-code-github-copilot-llm-gateway).
+**Workload:** RAG ingest, codebase analysis, book/document Q&A, long conversations without image input.
 
-### General-purpose default — `docker-compose.yml`
+218K + no vision + TQ3 KV + same sidecars. Vision drop frees ~1 GB, lifting the ceiling 20K above long-vision (198K → 218K) and letting us run at 0.985 mem-util. Same Cliff 1 closure mechanism. MTP AL 2.66, VRAM 23.7/24 GB.
 
-**Workload:** anything that doesn't fit the above narrowly. Mixed chat + light tools + occasional images.
+### Bulletproof / no cliffs — `llamacpp/default` ⭐
 
-48K + TQ3 KV + Genesis P65/P66/P64 + MTP n=3 + vision tower. Production-safe — below both prefill cliffs at 0.92 mem-util. **Verify-full's** 10K/30K/60K/90K needle ladder passes; tool-prefill check at 15K passes.
+**Workload:** production service for unpredictable users. Inputs that might be 5K or might be 200K. Tool returns that might be 1K or might be 50K. Anywhere "predictable behavior" beats "peak TPS."
 
-### Long single prompts — `tools-text.yml` (vLLM) or `llama.cpp` recipe
+`bash scripts/switch.sh llamacpp/default`. Q3_K_XL (Unsloth dynamic) + q4_0 KV at 262K + vision (mmproj). Different attention library entirely (ggml-cuda, not FA2) → no Cliff 1 mechanism, no Cliff 2 mechanism. Trade is ~21 TPS (~2.5× slower than vLLM). Quant validated by [Benjamin Marie's Kaitchup eval](https://kaitchup.substack.com/p/summary-of-qwen36-gguf-evals-updating).
 
-**Workload:** Loading a long document or repo in one shot, asking questions about it. RAG ingest, single-shot summarization. Cold prefill cost is the dominant factor.
+---
 
-- **vLLM `tools-text.yml`** (75K + fp8 + no vision): tested up to 60K-token single prompts. Beyond that, Cliff 2 (DeltaNet GDN forward) fires regardless of mem-util.
-- **llama.cpp** (262K + Q4_K_M + q4_0 KV): the only single-card path to the model's natural max. `bash scripts/switch.sh llamacpp/default`. ~21 TPS, but **no prefill cliffs anywhere** — this is the robust choice for unpredictable input sizes. See [llama-cpp/README](../models/qwen3.6-27b/llama-cpp/README.md) for quant + KV options.
+## Other variants in the repo (not recommended for shipping)
 
-**Cold prefill at 60K+ is genuinely slow** — 30-60 seconds for a fresh 50K-token doc on vLLM single-card. Use prefix caching aggressively if you'll re-query the same doc.
+These exist for troubleshooting, niche workloads, or historical comparison. Not promoted as primary because the long-* variants now cover their use cases:
 
-### Vision-heavy — default 48K with vision on
+- **`docker-compose.yml`** — 48K + TQ3 + vision, mem-util 0.92. The "below both cliffs by definition" baseline (engine HTTP-400-rejects requests >48K, so Cliff 2 is unreachable). Useful when you want bulletproof error behavior on a specific small-ctx workload, or as a fast-boot diagnostic. Most users should pick `long-vision` or `llamacpp/default` instead.
+- **`tools-text.yml`** — 75K + FP8 KV + PN8. Was the only Cliff-1-safe single-card path before PN12 anchor fix landed. FP8 KV is closer in quality to FP16 than TQ3 is, so kept around for accuracy-sensitive comparisons. Most IDE-agent workloads now run fine on `long-text.yml`.
+- **`minimal.yml`** — 32K + FP8 + no Genesis + no spec-decode. Stripped-down stack for isolating "is this a Genesis bug?" questions. Half the throughput of any other variant.
 
-**Workload:** Multimodal pipelines. Code-screenshot review, document OCR-style tasks, visual Q&A.
+## Watch list — Luce DFlash (not yet a recommendation)
 
-`docker-compose.yml` ships with vision tower (mmproj) active. Tower is small (~1 GB VRAM), comfortable headroom. For more context with vision, opt into `long-vision.yml` (192K) — but read the prefill caveat.
+Re-tested 2026-04-30 PM against [`Luce-Org/lucebox-hub`](https://github.com/Luce-Org/lucebox-hub) on Qwen3.6-27B Q4_K_M target + matched z-lab/Qwen3.6-27B-DFlash draft. **Closer to parity than 2026-04-22 — but several gaps still keep it off the recommended list:**
 
-### Frontier context — `long-vision.yml` (192K + vision) or `long-text.yml` (205K text-only)
+Measured TPS on this rig (RTX 3090, greedy, single-stream, n_gen=1000):
 
-**Workload:** "I need 100K+ context for whole-codebase / long-document workflows." Steady-state context accumulation across many small turns, NOT stuffing 192K of new tokens in one request.
+| Workload | Luce DFlash 3.6+3.6 (TQ3 KV, max_ctx=65K) | vLLM long-text 218K |
+|---|---|---|
+| Narrative essay | 37–47 TPS (mean ~40) | 50 TPS |
+| Code (heap/LRU/AST) | 63–76 TPS (mean ~72) | 66 TPS |
+| AL (code) | 5.9–7.1 | 3.4–3.8 (MTP) |
 
-- `long-vision.yml`: 192K + vision (engine ceiling at 0.98 mem-util). PN8 testing showed +6K headroom potential (192→198K), opt-in via uncommenting the env var.
-- `long-text.yml`: 205K text-only (engine ceiling capped by attention block-size divisor at ~206K).
+What works since 2026-04-22:
+- ✅ **Tool calls** via `server_tools.py` — parses Qwen `<tool_call>` format → returns OpenAI `tool_calls[]`. The big server-UX gap from last bench is closed.
+- ✅ **Streaming SSE** with `reasoning_content` deltas.
+- ✅ **Daemon mode** with cache-reuse for fast cold starts.
+- ✅ **Verify-stress 25K tool-prefill passes** at TQ3 KV + max_ctx=65K.
 
-**Critical caveat — Cliff 1 still fires on TQ3 paths:** ≥25K-token tool prefills will OOM regardless of mem-util tuning, because the 138 MiB allocate is an FFN intermediate-buffer activation peak (not draft-model footprint that PN8 fixes). For tool-using agents that return large blobs, **drop back to `tools-text.yml` or `docker-compose.yml`** — those are below the cliff. See [FAQ: prefill cliff](FAQ.md#whats-a-prefill-cliff).
+What still keeps it off the recommended list:
+- ❌ **Greedy only** — `temperature` / `top_p` ignored. Real downside for creative-writing workloads.
+- ❌ **3.6 draft under-trained** (z-lab snapshot 2026-04-26). Narrative AL ~3.7 vs code ~7.0; narr loses ~20% TPS to vLLM until training completes.
+- ❌ **No vision** tower.
+- ❌ **`enable_thinking` chat_template_kwargs handled differently** than vLLM — verify-full check 6 fails.
+- ❌ **Prefill cliff at higher max_ctx** — 25K tool prefill OOMs in `fattn-chunked.cu` at Q8_0 KV + max_ctx=65K (TQ3 KV closes it). At max_ctx=131K + TQ3, the daemon subprocess crashes (broken-pipe to FastAPI) on 30K+ probes.
+- ❌ **Build fragility** — fresh `git clone` of `dflash` main HEAD fails to compile (`ggml_turbo_wht` / `GGML_TYPE_TQ3_0` undefined) until you `git submodule update --init` after manual `git fetch` in `dflash/deps/llama.cpp`.
+- ❌ **Daemon-mode "empty prompt" regression** — after streaming requests, subsequent requests sometimes return 0 tokens; needs server restart.
 
-### Easy mode — llama.cpp Q3_K_XL
-
-**Workload:** First-time users, "just give me something that works." No Genesis, no AutoRound, no patched vLLM source. One Docker pull + one GGUF.
-
-`bash scripts/switch.sh llamacpp/default`. Q3_K_XL (Unsloth dynamic) + q4_0 KV at 262K + vision (mmproj). All `verify-stress.sh` checks pass clean — **no prefill cliffs anywhere on this engine.** Trade is throughput: ~21 TPS, ~2.5× slower than vLLM. Quant validated independently by [Benjamin Marie's Kaitchup eval](https://kaitchup.substack.com/p/summary-of-qwen36-gguf-evals-updating).
+**Re-test trigger:** z-lab tags the Qwen3.6-27B-DFlash draft as training-complete OR Luce-Org publishes a tagged release with the daemon-mode bug fixed. Track in [`docs/UPSTREAM.md`](UPSTREAM.md#luce-dflash-luce-orglucebox-hub).
 
 ---
 
@@ -99,7 +118,6 @@ For the cross-card TP=2 picture, see [`DUAL_CARD.md`](DUAL_CARD.md).
 |---|---|---|
 | 4 concurrent streams at 262K + vision | KV pool too small for 4 × full ctx | TP=2 (see DUAL_CARD.md) |
 | Peak code TPS (>100 TPS on quicksort prompt) | DFlash N=5 needs head_size=256 + non-causal — vLLM head-dim split | TP=2 + DFlash |
-| ≥25K tool prefills + 192K context together | Cliff 1 (FFN activation peak), no fix yet | TP=2 splits activation memory across cards |
 | Single-prompt >60K tokens on vLLM | Cliff 2 (DeltaNet GDN forward), no fix yet | TP=2 OR llama.cpp 262K (different engine) |
 
 ---
@@ -108,7 +126,7 @@ For the cross-card TP=2 picture, see [`DUAL_CARD.md`](DUAL_CARD.md).
 
 ### Prefill cliffs
 
-- **Cliff 1** — FFN intermediate-buffer activation peak (138 MiB allocate at `intermediate_size × max-num-batched-tokens`). Fires on long-ctx composes at >0.95 mem-util when prefill batch needs the buffer. **Closes on `tools-text.yml`** (FP8 KV path) since 2026-04-29 via Genesis PN8. Still fires on TQ3 paths (`long-vision.yml`, `long-text.yml`).
+- **Cliff 1** — FFN intermediate-buffer activation peak (138 MiB allocate at `intermediate_size × max-num-batched-tokens`). Historically fired on long-ctx composes at >0.95 mem-util when prefill batch needed the buffer. **Closed on `tools-text.yml`** (FP8 KV path) since 2026-04-29 via Genesis PN8. **Closed on TQ3 paths** (`long-vision.yml` 198K, `long-text.yml` 218K) since 2026-04-30 PM via PN12 anchor sidecar — see [`docs/CLIFFS.md`](CLIFFS.md).
 - **Cliff 2** — DeltaNet GDN forward OOM at 50-60K single-prompt regardless of mem-util. In `fla.ops` upstream, no file-replacement patch available. Watch [vllm#40914](https://github.com/vllm-project/vllm/pull/40914) and [FlashQLA](https://github.com/QwenLM/FlashQLA) for upstream fixes.
 
 ### VRAM peak vs idle

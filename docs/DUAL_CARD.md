@@ -6,14 +6,22 @@ You have **2× RTX 3090s, PCIe-only (no NVLink)**. This page is the front door f
 
 ## TL;DR — pick by workload
 
-| What you're doing | Compose | Narr / Code TPS | Why |
-|---|---|---|---|
-| General-purpose default (262K + vision + tools) | [`dual.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual.yml) ⭐ | **69 / 89** | fp8 KV, 2 streams, full feature set |
-| Multi-tenant (4 concurrent agents at full ctx) | [`dual-turbo.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual-turbo.yml) | **54 / 73 per-stream** (≈ 212/292 aggregate) | TQ3 KV (3 bits/token) frees room for 4 streams |
-| Peak code TPS with vision | [`dual-dflash.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual-dflash.yml) | **82 / 125** | DFlash N=5, AL ~4.4 (vs MTP's 3.4), 185K ctx |
-| Peak code TPS, no vision | [`dual-dflash-noviz.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual-dflash-noviz.yml) | **78 / 127** | DFlash + no vision, 200K ctx |
+| What you're doing | Compose | Max ctx | Narr / Code TPS | Why |
+|---|---|---|---|---|
+| General-purpose default (vision + tools + long ctx) | [`dual.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual.yml) ⭐ | **262K** (237K single-prompt verified) | **69 / 89** | fp8 KV, 2 streams, full feature set |
+| Multi-tenant (4 concurrent agents at full ctx) | [`dual-turbo.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual-turbo.yml) | **262K** | **54 / 73** per-stream (≈ 212/292 aggregate) | TQ3 KV (3 bits/token) frees room for 4 streams |
+| Peak code TPS with vision | [`dual-dflash.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual-dflash.yml) | **185K** | **82 / 125** | DFlash N=5, AL ~4.4 (vs MTP's 3.4) |
+| Peak code TPS, no vision | [`dual-dflash-noviz.yml`](../models/qwen3.6-27b/vllm/compose/docker-compose.dual-dflash-noviz.yml) | **200K** | **78 / 127** | DFlash + no vision, +15K ctx vs dual-dflash |
 
 Run any of these via `bash scripts/launch.sh` (interactive) or `bash scripts/switch.sh <variant>`.
+
+---
+
+## Measured TPS on 2× 3090
+
+![Qwen3.6-27B TPS — 2× 3090 configs (TP=2)](img/performance-dual.png)
+
+Bench protocol: 3 warm + 5 measured runs of the canonical narrative + code prompts on each config. Substrate: vLLM nightly `dev205+g07351e088` + Genesis pinned to `917519b` (v7.62.x), RTX 3090 sm_86 PCIe-only at 230 W. Per-config run-by-run + VRAM peaks: [models/qwen3.6-27b/CHANGELOG.md](../models/qwen3.6-27b/CHANGELOG.md).
 
 ---
 
@@ -77,7 +85,7 @@ For the single-card picture, see [`SINGLE_CARD.md`](SINGLE_CARD.md).
 | 4 concurrent streams at full context | Single-card serializes; can't fit | `dual-turbo.yml` — 4 streams, 262K each |
 | DFlash N=5 spec-decode | Blocked: DFlash needs head_size=256 + non-causal which doesn't fit single-card head-dim split | `dual-dflash.yml` / `dual-dflash-noviz.yml` |
 | Code TPS >100 | Best single-card is 67 code (default) | 125-127 code (DFlash variants) |
-| Long single prompts safely | Cliff 2 fires at 50-60K on vLLM single-card (forces llama.cpp fallback at 21 TPS) | TP=2 splits activation across cards — Cliff 2 doesn't fire on the prompts we tested |
+| Long single prompts safely | Cliff 2 fires at 50-60K on vLLM single-card (forces llama.cpp fallback at 21 TPS) | TP=2 splits activation across cards — **237K single-prompt verified** on `dual.yml` 2026-04-29 (~830 tok/s prefill, no OOM, peak 23.5 GB / card) |
 | Big tool returns at 192K context | Cliff 1 fires on TQ3 paths regardless | `dual.yml` is below the cliff at 262K — activation budget is bigger per-card after split |
 
 ---
@@ -148,16 +156,14 @@ bash scripts/switch.sh --list              # show all variants
 
 ## Performance summary
 
-![Qwen3.6-27B TPS — 2× 3090 configs (TP=2)](img/performance-dual.png)
-
 For variance, AL / accept rates, per-config row docstrings: see each compose YAML, plus the [TPS chart for the full lineup](../README.md#measured-tps-at-a-glance) in the top-level README.
 
-| Compose | Narr / Code TPS | TTFT | Concurrency | Vision | Best for |
-|---|---|---|---|---|---|
-| `dual.yml` | 69 / 89 | ~145 ms | 2 | ✅ | general default |
-| `dual-turbo.yml` | 54 / 73 per stream | ~115 ms | 4 | ✅ | multi-tenant |
-| `dual-dflash.yml` | 82 / 125 | ~140 ms | 1 | ✅ | code + vision |
-| `dual-dflash-noviz.yml` | 78 / 127 | ~145 ms | 1 | ❌ | pure text code |
+| Compose | Max ctx | Narr / Code TPS | TTFT | Concurrency | Vision | Best for |
+|---|---|---|---|---|---|---|
+| `dual.yml` | 262K | 69 / 89 | ~145 ms | 2 | ✅ | general default |
+| `dual-turbo.yml` | 262K | 54 / 73 per stream | ~115 ms | 4 | ✅ | multi-tenant |
+| `dual-dflash.yml` | 185K | 82 / 125 | ~140 ms | 1 | ✅ | code + vision |
+| `dual-dflash-noviz.yml` | 200K | 78 / 127 | ~145 ms | 1 | ❌ | pure text code |
 
 All numbers measured 2026-04-28 on club-3090 substrate (3 warmup + 5 measured runs, canonical narrative + code prompts). Run-by-run + CV in `models/qwen3.6-27b/CHANGELOG.md` "Dual-card re-bench" entry.
 
